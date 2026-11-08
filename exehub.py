@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
+try:
+    import psutil
+except Exception:          # tracking falls back to the single launched process
+    psutil = None
+
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QUrl, QEvent
 from PySide6.QtGui import (
     QPixmap, QIcon, QPainter, QColor, QFont, QFontMetrics, QPen, QLinearGradient,
@@ -627,6 +632,99 @@ class PopenProc:
 
     def poll(self):
         return self.p.poll()
+
+
+IGNORE_EXES = {"conhost.exe", "werfault.exe", "crashpad_handler.exe", "crashreportclient.exe",
+               "unitycrashhandler32.exe", "unitycrashhandler64.exe", "dxsetup.exe"}
+
+
+class TreeProc:
+    """Follows a game as a process tree, so launcher stubs (Steam, Epic, anti-cheat bootstrappers) don't end the session.
+    - children/grandchildren of anything we track are adopted automatically
+    - if the launched exe quits fast with code 0 (a hand-off), we look for fresh processes that live in the game's
+      folder for a short grace window and adopt those
+    The session ends when nothing we track is alive any more."""
+    GRACE = 25.0
+
+    def __init__(self, popen, game_dir, started):
+        self.p = popen
+        self.dir = os.path.normcase(os.path.abspath(game_dir)).rstrip("\\/") + os.sep
+        self.started = started
+        self.tracked = {}                 # pid -> create_time (guards against pid reuse)
+        self.root_code = None
+        self.root_gone = None
+        self.adopted_other = False
+        self.stub = False                 # hand-off we never managed to follow
+        self.code = None
+        self.next_scan = 0.0
+        self.me = os.getpid()
+        self._add(popen.pid, force=True)
+
+    def _add(self, pid, force=False):
+        try:
+            pr = psutil.Process(pid)
+            if not force and (pid == self.me or pr.name().lower() in IGNORE_EXES):
+                return
+            if pid not in self.tracked:
+                self.tracked[pid] = pr.create_time()
+                if pid != self.p.pid:
+                    self.adopted_other = True
+        except Exception:
+            pass
+
+    def _alive(self):
+        n = 0
+        for pid, ct in list(self.tracked.items()):
+            try:
+                pr = psutil.Process(pid)
+                if pr.create_time() == ct and pr.status() != psutil.STATUS_ZOMBIE:
+                    n += 1
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+            except Exception:
+                n += 1                     # access denied etc.: assume it's still running
+                continue
+            self.tracked.pop(pid, None)
+        return n
+
+    def _scan(self, hunt):
+        for pid in list(self.tracked):
+            try:
+                for c in psutil.Process(pid).children(recursive=True):
+                    self._add(c.pid)
+            except Exception:
+                pass
+        if hunt:
+            try:
+                for pr in psutil.process_iter(["pid", "exe", "create_time"]):
+                    info = pr.info
+                    exe, ct = info.get("exe"), info.get("create_time") or 0
+                    if exe and ct >= self.started - 1 and os.path.normcase(exe).startswith(self.dir):
+                        self._add(info["pid"])
+            except Exception:
+                pass
+
+    def poll(self):
+        if self.code is not None:
+            return self.code
+        now = time.time()
+        if self.root_code is None:
+            self.root_code = self.p.poll()
+            if self.root_code is not None:
+                self.root_gone = now
+        hunt = (self.root_code == 0 and self.root_gone - self.started < 10 and now - self.root_gone < self.GRACE)
+        if now >= self.next_scan:
+            self.next_scan = now + (0.7 if hunt else 2.0)
+            self._scan(hunt)
+        if self.root_code is None or self._alive():
+            return None                    # (root can die before psutil ever saw it: never trust "nothing tracked")
+        if hunt and not self.adopted_other:
+            return None                    # launcher stub gone, real game not seen yet: keep looking
+        self.stub = (self.root_code == 0 and self.root_gone is not None
+                     and self.root_gone - self.started < 10 and not self.adopted_other)
+        self.code = self.root_code if self.root_code is not None else 0
+        return self.code
 
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
@@ -1256,11 +1354,12 @@ class Hub(QWidget):
         if r is None or g is None:
             return
         life = time.time() - r["start"]
-        g["seconds"] = g.get("seconds", 0) + int(life)
+        lost = bool(getattr(r["proc"], "stub", False))      # hand-off we couldn't follow: waiting around isn't playtime
+        g["seconds"] = g.get("seconds", 0) + (0 if lost else int(life))
         g["last_played"] = time.time()
         save(self.data)
         self.lock_until = time.perf_counter() + 1.5          # keys you mashed in-game must not hit the hub
-        stub = life < 6 and code == 0                       # launcher stub that handed off to the real game
+        stub = lost or (life < 6 and code == 0)             # launcher stub that handed off to the real game
         hidden = not self.isVisible()
         self.launching = None
         if stub and hidden:
@@ -1346,9 +1445,10 @@ class Hub(QWidget):
                 cmdline = subprocess.list2cmdline([g["path"]])
                 if g.get("args", "").strip():
                     cmdline += " " + g["args"].strip()
-                proc = PopenProc(subprocess.Popen(
+                popen = subprocess.Popen(
                     cmdline, cwd=cwd,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = TreeProc(popen, cwd, time.time()) if psutil else PopenProc(popen)
             except OSError as ex:
                 if getattr(ex, "winerror", None) == 740:      # "requires elevation"
                     admin = True
@@ -1679,6 +1779,7 @@ class Hub(QWidget):
         m = QMenu(self)
         a_play = m.addAction("Play")
         a_admin = m.addAction("Run as administrator")
+        a_stop = m.addAction("Mark as finished") if g["id"] in self.running else None
         m.addSeparator()
         a_edit = m.addAction("Edit...")
         a_icon = m.addAction("Refresh icon")
@@ -1697,6 +1798,8 @@ class Hub(QWidget):
             self.launch(g)
         elif act == a_admin:
             self.launch(g, admin=True)
+        elif a_stop is not None and act == a_stop:
+            self.finish_game(g["id"], 0)
         elif act == a_edit:
             self.edit_game(g)
         elif act == a_icon:
