@@ -9,7 +9,7 @@ Xbox pad : D-pad / left stick browse, A play, Y options, X add, Back = style,
            Start = fullscreen, LB/RB skip
 Spotify  : the corner card shows what Spotify is playing (read from Windows, no login)
 """
-import sys, os, io, json, uuid, time, math, random, shlex, subprocess, hashlib, ctypes
+import sys, os, io, json, uuid, time, math, random, subprocess, hashlib, ctypes
 import asyncio, threading, shutil, traceback, colorsys, faulthandler
 from datetime import datetime, timezone
 from contextlib import contextmanager
@@ -454,6 +454,13 @@ def theme(g: dict):
 _art_cache: dict = {}
 
 
+def _art_cache_stamp(g: dict):
+    try:
+        return (ICONS / f"{g['id']}.png").stat().st_mtime
+    except OSError:
+        return 0
+
+
 def card_art(g: dict) -> QPixmap:
     ip = ICONS / f"{g['id']}.png"
     try:
@@ -528,6 +535,8 @@ def card_art(g: dict) -> QPixmap:
     p.setPen(QPen(QColor(255, 255, 255, 50), 2))
     p.drawRoundedRect(QRectF(1, 1, TW - 2, TH - 2), ART_R - 1, ART_R - 1)
     p.end()
+    while len(_art_cache) >= 80:                       # ~1.2 MB per card: cap it (oldest goes first)
+        _art_cache.pop(next(iter(_art_cache)))
     _art_cache[key] = pm
     return pm
 
@@ -537,7 +546,7 @@ _bg_cache: dict = {}
 
 def bg_pixmap(g: dict, w: int, h: int) -> QPixmap:
     """Heavily blurred card, low-res on purpose (cheap, and lets the camera drift)."""
-    key = (g["id"], g.get("cover", ""), g.get("accent", ""), w, h, len(_art_cache))
+    key = (g["id"], g.get("cover", ""), g.get("accent", ""), w, h, _art_cache_stamp(g))
     if key in _bg_cache:
         return _bg_cache[key]
     if len(_bg_cache) > 10:
@@ -923,9 +932,9 @@ class Hub(QWidget):
 
         self.data = load()
         self.settings = self.data.setdefault("settings", {})
-        self.style = self.settings.get("style", "carousel")
-        if self.style not in ("carousel", "grid"):
-            self.style = "carousel"
+        self.view_style = self.settings.get("style", "carousel")
+        if self.view_style not in ("carousel", "grid"):
+            self.view_style = "carousel"
         self.ipc = ipc
         if ipc:
             ipc.newConnection.connect(self.on_ipc)
@@ -935,7 +944,7 @@ class Hub(QWidget):
         self.items: list = []
         self.sel_i = 0
         self.prev_sel = 0
-        self.scroll = 0.0
+        self.scroll_pos = 0.0
         self.gscroll = 0.0
         self.gtarget = 0
         self.t = 0.0
@@ -1032,7 +1041,7 @@ class Hub(QWidget):
                 self.settings["icons_v"] = ICON_VERSION
 
         self.rebuild()
-        self.scroll = float(self.sel_i)
+        self.scroll_pos = float(self.sel_i)
         self.bg_prev = self.bg_cur
         self.snap_colors()
         if LOAD_NOTE:
@@ -1053,7 +1062,7 @@ class Hub(QWidget):
 
     def loop_mode(self):
         """Carousel wraps around (so the sides are never empty) once there are 3+ tiles."""
-        return self.style == "carousel" and len(self.items) >= 3
+        return self.view_style == "carousel" and len(self.items) >= 3
 
     def rebuild(self, select_id=None):
         old_n = len(self.items)
@@ -1069,7 +1078,7 @@ class Hub(QWidget):
         self.set_sel(idx, force=True)
         if len(self.items) != old_n or not self.loop_mode():
             self.sel_abs = idx
-            self.scroll = float(self.sel_abs)
+            self.scroll_pos = float(self.sel_abs)
 
     def _sel_changed(self):
         self.info_t = 0.0
@@ -1108,7 +1117,7 @@ class Hub(QWidget):
             self.set_sel(self.sel_i + d)
 
     def cols(self):
-        return self.grid_metrics()["cols"] if self.style == "grid" else 1
+        return self.grid_metrics()["cols"] if self.view_style == "grid" else 1
 
     def update_targets(self):
         it = self.current_item()
@@ -1180,10 +1189,10 @@ class Hub(QWidget):
             self.setCursor(Qt.CursorShape.BlankCursor if blank else Qt.CursorShape.ArrowCursor)
 
         k = 1 - math.exp(-dt * 10)
-        self.scroll += (self.sel_abs - self.scroll) * k
-        if abs(self.sel_abs - self.scroll) < 0.0008:
-            self.scroll = float(self.sel_abs)
-        if self.style == "grid":
+        self.scroll_pos += (self.sel_abs - self.scroll_pos) * k
+        if abs(self.sel_abs - self.scroll_pos) < 0.0008:
+            self.scroll_pos = float(self.sel_abs)
+        if self.view_style == "grid":
             gm = self.grid_metrics()
             r = self.sel_i // gm["cols"]
             if r < self.gtarget:
@@ -1293,6 +1302,21 @@ class Hub(QWidget):
         except Exception:
             pass
 
+    def toggle_fullscreen(self):
+        """F11 / Start: borderless fullscreen <-> normal window."""
+        self.windowed = not self.windowed
+        flags = Qt.WindowType.Window if self.windowed else (Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(flags)               # recreates the native window: re-apply the dark title bar on show
+        self._styled = False
+        if self.windowed:
+            self.showNormal()
+            self.resize(1280, 780)
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.enter_fullscreen()
+        self.say("Windowed" if self.windowed else "Fullscreen", 1.5)
+
     def bring_front(self):
         self.enter_fullscreen()
 
@@ -1303,7 +1327,7 @@ class Hub(QWidget):
         self.bring_front()
 
     def tile_center(self):
-        if self.style == "grid":
+        if self.view_style == "grid":
             return self.grid_rect(self.sel_i, self.grid_metrics()).center()
         return self.tile_geom(self.sel_abs, self.metrics())[0].center()
 
@@ -1319,8 +1343,11 @@ class Hub(QWidget):
         proc = None
         if not admin:
             try:
+                cmdline = subprocess.list2cmdline([g["path"]])
+                if g.get("args", "").strip():
+                    cmdline += " " + g["args"].strip()
                 proc = PopenProc(subprocess.Popen(
-                    [g["path"]] + shlex.split(g.get("args", ""), posix=False), cwd=cwd,
+                    cmdline, cwd=cwd,
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             except OSError as ex:
                 if getattr(ex, "winerror", None) == 740:      # "requires elevation"
@@ -1474,7 +1501,7 @@ class Hub(QWidget):
                         self.move(-1)
                     elif name == "r":
                         self.move(1)
-                    elif self.style == "grid":
+                    elif self.view_style == "grid":
                         self.move(-self.cols() if name == "u" else self.cols())
             else:
                 self._rep.pop(name, None)
@@ -1486,6 +1513,8 @@ class Hub(QWidget):
             self.add_dialog()
         if pressed & 0x2000:
             self.back()
+        if pressed & 0x0010:
+            self.toggle_fullscreen()
         if pressed & 0x0020:
             self.toggle_style()
         if pressed & 0x0100:
@@ -1534,11 +1563,18 @@ class Hub(QWidget):
             self.dlg_close(False)
 
     def ask_quit(self):
-        txt = ("A game is still running - its playtime won't be saved if you quit the hub now."
+        txt = ("A game is still running - its playtime so far will be saved, but the hub can't track it after you quit."
                if self.running else "Close EXE//HUB completely?")
         self.ask("Quit EXE//HUB", txt, "Quit", self.quit_now, danger=True)
 
     def shutdown_save(self):
+        now = time.time()
+        for gid, r in self.running.items():          # credit what's been played so far (start resets: safe to call twice)
+            g = self.game(gid)
+            if g is not None:
+                g["seconds"] = g.get("seconds", 0) + int(now - r["start"])
+                g["last_played"] = now
+            r["start"] = now
         save(self.data)
         self.np._quit = True
 
@@ -1566,14 +1602,14 @@ class Hub(QWidget):
         QApplication.instance().exit(0)
 
     def toggle_style(self):
-        self.style = "grid" if self.style == "carousel" else "carousel"
-        self.settings["style"] = self.style
+        self.view_style = "grid" if self.view_style == "carousel" else "carousel"
+        self.settings["style"] = self.view_style
         save(self.data)
         self.sel_abs = self.sel_i
-        self.scroll = float(self.sel_abs)
+        self.scroll_pos = float(self.sel_abs)
         self.info_t = 0.0
         self.gscroll = self.gtarget = 0
-        self.say("Style: Grid" if self.style == "grid" else "Style: Carousel", 1.8)
+        self.say("Style: Grid" if self.view_style == "grid" else "Style: Carousel", 1.8)
 
     def activate(self):
         it = self.current_item()
@@ -1722,6 +1758,8 @@ class Hub(QWidget):
                 self.edit_game(g)
         elif k == K.Key_Escape:
             self.back()
+        elif k == K.Key_F11:
+            self.toggle_fullscreen()
         elif k == K.Key_Menu:
             self.options_menu()
         elif k == K.Key_O and ctrl:
@@ -1740,7 +1778,7 @@ class Hub(QWidget):
             super().keyPressEvent(e)
 
     def tile_at(self, pos):
-        if self.style == "grid":
+        if self.view_style == "grid":
             gm = self.grid_metrics()
             for i in range(len(self.items)):
                 r = self.grid_rect(i, gm)
@@ -1749,7 +1787,7 @@ class Hub(QWidget):
             return None
         m = self.metrics()
         n = len(self.items)
-        for k in sorted(self.carousel_ks(m), key=lambda k: abs(k - self.scroll)):
+        for k in sorted(self.carousel_ks(m), key=lambda k: abs(k - self.scroll_pos)):
             rect, _s, _n = self.tile_geom(k, m)
             if rect.adjusted(-6, -6, 6, 6).contains(pos):
                 return k % n
@@ -1883,7 +1921,7 @@ class Hub(QWidget):
 
     def tile_geom(self, i, m):
         w, h, tw, th, cy = m
-        d = i - self.scroll
+        d = i - self.scroll_pos
         ad = abs(d)
         near = 1 - min(ad, 1.0)
         s = 0.80 + 0.20 * near
@@ -1942,27 +1980,26 @@ class Hub(QWidget):
             p.end()
 
     def paint_scene(self, p, w, h):
-        if True:
-            self.paint_bg(p, w, h)
-            p.setOpacity(self.chrome)
-            self.paint_top(p, w)
-            p.setOpacity(1.0)
-            if self.style == "grid":
-                gm = self.grid_metrics()
-                self.paint_grid(p, gm)
-                self.paint_info(p, w, h, gm["hero_top"])
-            else:
-                m = self.metrics()
-                self.paint_carousel(p, m)
-                self.paint_info(p, w, h, m[4] + m[3] / 2 + 30)
-            p.setOpacity(self.chrome)
-            self.paint_bottom(p, w, h)
-            p.setOpacity(1.0)
-            self.paint_spotify(p, w, h)
-            self.paint_overlays(p, w, h)
-            self.paint_launch(p, w, h)
-            self.paint_dialog(p, w, h)
-            self.paint_fade(p, w, h)
+        self.paint_bg(p, w, h)
+        p.setOpacity(self.chrome)
+        self.paint_top(p, w)
+        p.setOpacity(1.0)
+        if self.view_style == "grid":
+            gm = self.grid_metrics()
+            self.paint_grid(p, gm)
+            self.paint_info(p, w, h, gm["hero_top"])
+        else:
+            m = self.metrics()
+            self.paint_carousel(p, m)
+            self.paint_info(p, w, h, m[4] + m[3] / 2 + 30)
+        p.setOpacity(self.chrome)
+        self.paint_bottom(p, w, h)
+        p.setOpacity(1.0)
+        self.paint_spotify(p, w, h)
+        self.paint_overlays(p, w, h)
+        self.paint_launch(p, w, h)
+        self.paint_dialog(p, w, h)
+        self.paint_fade(p, w, h)
 
     def paint_bg(self, p, w, h):
         base = QLinearGradient(0, 0, 0, h)
@@ -2071,7 +2108,7 @@ class Hub(QWidget):
         self.round_button(p, pw_r, self.hover == "power")
         self.draw_power_icon(p, pw_r)
         self.round_button(p, st_r, self.hover == "style")
-        self.draw_style_icon(p, st_r, self.style == "carousel")
+        self.draw_style_icon(p, st_r, self.view_style == "carousel")
         right = st_r.left() - 22
 
         now = time.localtime()
@@ -2115,7 +2152,7 @@ class Hub(QWidget):
         w, tw = m[0], m[2]
         n = len(self.items)
         R = int((w / 2) / (tw * 0.8) + 2.2)
-        base = math.floor(self.scroll)
+        base = math.floor(self.scroll_pos)
         if self.loop_mode():
             return range(base - R, base + R + 2)
         return range(max(0, base - R), min(n, base + R + 2))
@@ -2123,8 +2160,8 @@ class Hub(QWidget):
     def paint_carousel(self, p, m):
         w = m[0]
         n = len(self.items)
-        for k in sorted(self.carousel_ks(m), key=lambda k: -abs(k - self.scroll)):
-            ad = abs(k - self.scroll)
+        for k in sorted(self.carousel_ks(m), key=lambda k: -abs(k - self.scroll_pos)):
+            ad = abs(k - self.scroll_pos)
             te = ease_out(self.intro * 1.7 - ad * 0.10)
             if te <= 0:
                 continue
@@ -2360,7 +2397,7 @@ class Hub(QWidget):
         sub_y = base + th_ + 2
         p.drawText(QRectF(0, sub_y, w, 24), Qt.AlignmentFlag.AlignCenter, sub)
 
-        by = sub_y + 24 + 22 if self.style == "carousel" else sub_y + 24 + 18
+        by = sub_y + 24 + 22 if self.view_style == "carousel" else sub_y + 24 + 18
         bw, bh, gap = 214, 52, 14
         bx = (w - bw) / 2
         play_r = QRectF(bx, by, bw, bh)
